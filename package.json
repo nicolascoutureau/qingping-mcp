@@ -1,0 +1,47 @@
+{
+  "name": "qingping-mcp",
+  "version": "0.1.0",
+  "description": "Serveur MCP pour les capteurs Qingping (Air Monitor CGS1…) via l'Open API cloud",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "qingping-mcp": "dist/index.js"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3",
+    "@types/node": "25.9.3",
+    "vitest": "4.1.9"
+  },
+  "license": "MIT",
+  "author": "Nicolas Coutureau",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nicolascoutureau/qingping-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "qingping",
+    "cleargrass",
+    "air-quality",
+    "co2",
+    "claude"
+  ],
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ]
+}
