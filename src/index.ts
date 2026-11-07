@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
- * index.ts — Serveur MCP Qingping (stdio).
+ * index.ts — Qingping MCP server (stdio).
  *
- * Outils :
- *   qingping_current   mesures actuelles (+ niveaux) de tous les capteurs ou d'un seul
- *   qingping_history   historique : résumé par métrique (min/max/moyenne, temps au-dessus des seuils) + série optionnelle
- *   qingping_alerts    alertes déclenchées (seuils réglés dans l'app Qingping+)
- *   qingping_set_intervals  intervalles de mesure / d'envoi au cloud
+ * Tools:
+ *   qingping_current        latest readings (+ plain-language levels) of every sensor or of one
+ *   qingping_history        history: per-metric summary (min/max/avg, time above thresholds) + optional series
+ *   qingping_alerts         triggered alerts (thresholds set in the Qingping app)
+ *   qingping_set_intervals  collect / report-to-cloud intervals
  *
- * Variables d'environnement : QINGPING_APP_KEY, QINGPING_APP_SECRET
+ * Environment: QINGPING_APP_KEY, QINGPING_APP_SECRET
  * (developer.qingping.co → Access management).
  */
 
@@ -18,9 +18,9 @@ import { z } from 'zod';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { METRIC_KEYS, QingpingClient, normalizeMac, type Device, type MetricKey } from './client.js';
-import { assess, downsample, summarize, withUnits } from './analysis.js';
+import { assess, coverage, downsample, freshness, summarize, withUnits } from './analysis.js';
 
-// Clés : variables d'environnement, sinon le fichier .env à la racine du projet.
+// Keys: environment variables, otherwise the .env file at the project root.
 if (!process.env.QINGPING_APP_KEY || !process.env.QINGPING_APP_SECRET) {
   const envFile = fileURLToPath(new URL('../.env', import.meta.url));
   if (existsSync(envFile)) process.loadEnvFile(envFile);
@@ -36,54 +36,55 @@ function fail(err: unknown) {
   return { content: [{ type: 'text' as const, text: message }], isError: true as const };
 }
 
-/** Trouve les capteurs visés : MAC exacte, ou nom (sans casse, partiel). Sans filtre : tous. */
+const describeDevices = (list: Device[]) => list.map((d) => `${d.name ?? '?'} (${d.mac})`).join(', ');
+
+/** Target sensors: exact MAC, or name (case-insensitive, partial). No filter: all of them. */
 async function resolveDevices(device?: string): Promise<Device[]> {
   const all = await client.listDevices();
-  if (!all.length) throw new Error("Aucun appareil lié à ce compte Qingping.");
+  if (!all.length) throw new Error('No device is bound to this Qingping account.');
   if (!device) return all;
   const q = device.trim().toLowerCase();
   const mac = normalizeMac(device);
   const found = all.filter((d) => d.mac === mac || (d.name ?? '').toLowerCase().includes(q));
-  if (!found.length) {
-    throw new Error(
-      `Aucun appareil ne correspond à « ${device} ». Appareils : ${all.map((d) => `${d.name ?? '?'} (${d.mac})`).join(', ')}`,
-    );
-  }
+  if (!found.length) throw new Error(`No device matches "${device}". Devices: ${describeDevices(all)}`);
   return found;
 }
 
-/** Un seul capteur : celui demandé, ou l'unique capteur du compte. */
+/** A single sensor: the one asked for, or the only sensor of the account. */
 async function resolveOne(device?: string): Promise<Device> {
   const found = await resolveDevices(device);
   if (found.length > 1) {
-    throw new Error(
-      `Plusieurs appareils correspondent ; précisez « device » : ${found.map((d) => `${d.name ?? '?'} (${d.mac})`).join(', ')}`,
-    );
+    throw new Error(`Several devices match; specify "device": ${describeDevices(found)}`);
   }
   return found[0];
 }
 
-/** Fenêtre de temps en secondes Unix, depuis start/end ISO ou les N dernières heures. */
+/** Time window in Unix seconds, from ISO start/end or the last N hours. */
 function window(args: { hours?: number; start?: string; end?: string }): [number, number] {
   const parse = (s: string, label: string) => {
     const t = Date.parse(s);
-    if (!Number.isFinite(t)) throw new Error(`Date « ${label} » illisible : ${s}`);
+    if (!Number.isFinite(t)) throw new Error(`Unreadable "${label}" date: ${s}`);
     return Math.floor(t / 1000);
   };
   const end = args.end ? parse(args.end, 'end') : Math.floor(Date.now() / 1000);
   const start = args.start ? parse(args.start, 'start') : end - Math.round((args.hours ?? 24) * 3600);
-  if (start >= end) throw new Error('« start » doit précéder « end ».');
+  if (start >= end) throw new Error('"start" must be before "end".');
   return [start, end];
 }
 
 const deviceParam = z
   .string()
   .optional()
-  .describe("Nom ou adresse MAC de l'appareil. Facultatif s'il n'y en a qu'un sur le compte.");
+  .describe('Device name or MAC address. Optional when the account has a single device.');
 const timeParams = {
-  hours: z.number().positive().max(24 * 90).optional().describe('Les N dernières heures (défaut 24). Ignoré si start est donné.'),
-  start: z.string().optional().describe('Début, ISO 8601 (ex. 2026-11-06T22:00:00+01:00).'),
-  end: z.string().optional().describe('Fin, ISO 8601. Défaut : maintenant.'),
+  hours: z
+    .number()
+    .positive()
+    .max(24 * 90)
+    .optional()
+    .describe('The last N hours (default 24). Ignored when start is given.'),
+  start: z.string().optional().describe('Start, ISO 8601 (e.g. 2026-11-06T22:00:00+01:00).'),
+  end: z.string().optional().describe('End, ISO 8601. Default: now.'),
 };
 
 const server = new McpServer({ name: 'qingping', version: '0.1.0' });
@@ -91,23 +92,35 @@ const server = new McpServer({ name: 'qingping', version: '0.1.0' });
 server.registerTool(
   'qingping_current',
   {
-    title: 'Mesures actuelles',
+    title: 'Current readings',
     description:
-      "Dernières mesures des capteurs Qingping (CO₂, PM2.5, PM10, tVOC, température, humidité, batterie…) avec un niveau lisible (bon / élevé — aérer…). " +
-      "readingAt indique l'heure de la mesure : le capteur n'envoie au cloud qu'à chaque intervalle de report (souvent 15 min).",
+      'Latest readings of Qingping sensors (CO₂, PM2.5, PM10, tVOC, temperature, humidity, battery…) with a plain-language level (good / high — ventilate…). ' +
+      'readingAt / ageMin give the time and age of the reading: the sensor only sends to the cloud once per report interval (often 15 min). ' +
+      'staleWarning appears when the reading is late relative to that interval.',
     inputSchema: { device: deviceParam },
     annotations: { readOnlyHint: true },
   },
   async ({ device }) => {
     try {
       const devices = await resolveDevices(device);
+      const nowS = Math.floor(Date.now() / 1000);
       return ok(
-        devices.map((d) => ({
+        devices.map((d) => {
+          const fresh = freshness(d.readingTs, d.reportIntervalS, nowS);
+          return {
           name: d.name,
           mac: d.mac,
           model: d.model,
           offline: d.offline,
           readingAt: d.readingAt,
+          ageMin: fresh.ageMin,
+          ...(fresh.stale && d.readingTs
+            ? {
+                staleWarning:
+                  `Reading is ${fresh.ageMin} min old while the sensor should report every ${d.reportIntervalS ? d.reportIntervalS / 60 : '?'} min: ` +
+                  'these values may not describe the air right now. The sensor may no longer reach the cloud (Wi-Fi, Internet, power).',
+              }
+            : {}),
           readings: withUnits(d.readings),
           assessment: assess(d.readings),
           ...(d.unhealthy.length ? { sensorWarnings: d.unhealthy } : {}),
@@ -115,11 +128,13 @@ server.registerTool(
             ? {}
             : {
                 note:
-                  "Aucune mesure reçue par le cloud Qingping pour cet appareil. Il envoie probablement ses données ailleurs (appairé dans Mi Home, ou une config MQTT privée) : le réappairer dans l'app Qingping+ / Qingping IoT.",
+                  'The Qingping cloud has no reading for this device: it is not reaching the cloud. ' +
+                  'If the date/time on its screen is wrong (e.g. 2015), it is on Wi-Fi but has no Internet access: reset its Wi-Fi and pair it again in the app.',
               }),
           reportIntervalMin: d.reportIntervalS ? d.reportIntervalS / 60 : null,
           collectIntervalMin: d.collectIntervalS ? d.collectIntervalS / 60 : null,
-        })),
+          };
+        }),
       );
     } catch (err) {
       return fail(err);
@@ -130,25 +145,26 @@ server.registerTool(
 server.registerTool(
   'qingping_history',
   {
-    title: 'Historique des mesures',
+    title: 'Reading history',
     description:
-      "Historique d'un capteur Qingping sur une période. Renvoie par métrique min / max / moyenne / première / dernière valeur, " +
-      "l'heure du min et du max, et le temps passé au-dessus des seuils (CO₂ > 1000 et > 1500 ppm, PM2.5 > 15 et > 35, humidité > 60 et > 70 %). " +
-      'Avec max_points > 0, ajoute la série (moyennée par tranches) pour tracer une courbe.',
+      'History of a Qingping sensor over a period. Returns, per metric, min / max / average / first / last value, ' +
+      'the time of the min and max, and the minutes spent above thresholds (CO₂ > 1000 and > 1500 ppm, PM2.5 > 15 and > 35, humidity > 60 and > 70 %). ' +
+      'With max_points > 0, also returns the series (averaged per bucket) to draw a chart. ' +
+      'coverage gives the share of the period actually measured: an empty or partial history means "no data", not "nothing to report".',
     inputSchema: {
       device: deviceParam,
       ...timeParams,
       metrics: z
         .array(z.enum(METRIC_KEYS))
         .optional()
-        .describe('Limiter à ces métriques (ex. ["co2","pm25"]). Défaut : toutes.'),
+        .describe('Restrict to these metrics (e.g. ["co2","pm25"]). Default: all.'),
       max_points: z
         .number()
         .int()
         .min(0)
         .max(1000)
         .optional()
-        .describe('Nombre max de points de la série renvoyée (0 = résumé seul, défaut 0).'),
+        .describe('Max number of points in the returned series (0 = summary only, default 0).'),
     },
     annotations: { readOnlyHint: true },
   },
@@ -158,9 +174,25 @@ server.registerTool(
       const [s, e] = window({ hours, start, end });
       const samples = await client.history(d.mac, s, e);
       const keys = metrics as MetricKey[] | undefined;
+      const summary = summarize(samples, keys);
+      const intervalS = summary.sampleIntervalMin ? summary.sampleIntervalMin * 60 : d.collectIntervalS;
+      const cov = coverage(samples, s, e, intervalS);
+      let note: string | undefined;
+      if (!samples.length) {
+        note =
+          'No readings in this period: the sensor sent nothing to the cloud (offline, Wi-Fi without Internet, or not yet connected). ' +
+          'This is not "nothing to report": nothing is known about this period.' +
+          (d.readingAt ? ` Latest known reading: ${d.readingAt}.` : '');
+      } else if (cov.percent < 80) {
+        note =
+          `Partial data: ${cov.percent}% of the period covered (largest gap: ${cov.largestGapMin} min). ` +
+          'Min / max / minutes above thresholds only describe the measured part.';
+      }
       return ok({
         device: { name: d.name, mac: d.mac, model: d.model },
-        ...summarize(samples, keys),
+        ...(note ? { note } : {}),
+        coverage: cov,
+        ...summary,
         ...(max_points ? { series: downsample(samples, max_points, keys) } : {}),
       });
     } catch (err) {
@@ -172,9 +204,9 @@ server.registerTool(
 server.registerTool(
   'qingping_alerts',
   {
-    title: 'Alertes déclenchées',
+    title: 'Triggered alerts',
     description:
-      "Alertes déclenchées par un capteur Qingping sur une période (seuils réglés dans l'app Qingping+, ex. CO₂ > 1000 ppm).",
+      'Alerts triggered by a Qingping sensor over a period (thresholds set in the Qingping app, e.g. CO₂ > 1000 ppm).',
     inputSchema: { device: deviceParam, ...timeParams },
     annotations: { readOnlyHint: true },
   },
@@ -193,14 +225,14 @@ server.registerTool(
 server.registerTool(
   'qingping_set_intervals',
   {
-    title: "Régler les intervalles",
+    title: 'Set intervals',
     description:
-      "Change l'intervalle de mesure (collect) et d'envoi au cloud (report) d'un capteur Qingping. " +
-      "Un report court donne des données plus fraîches mais use plus la batterie si l'appareil n'est pas sur secteur.",
+      'Changes the measurement (collect) and cloud upload (report) intervals of a Qingping sensor. ' +
+      'A short report interval gives fresher data but drains the battery faster when the device is not plugged in.',
     inputSchema: {
       device: deviceParam,
-      report_interval_min: z.number().int().min(1).max(1440).describe("Envoi au cloud toutes les N minutes."),
-      collect_interval_min: z.number().int().min(1).max(1440).describe('Mesure toutes les N minutes.'),
+      report_interval_min: z.number().int().min(1).max(1440).describe('Upload to the cloud every N minutes.'),
+      collect_interval_min: z.number().int().min(1).max(1440).describe('Measure every N minutes.'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   },
@@ -212,7 +244,7 @@ server.registerTool(
         device: { name: d.name, mac: d.mac },
         reportIntervalMin: report_interval_min,
         collectIntervalMin: collect_interval_min,
-        note: "Pris en compte par l'appareil à son prochain envoi au cloud.",
+        note: 'Applied by the device at its next upload to the cloud.',
       });
     } catch (err) {
       return fail(err);

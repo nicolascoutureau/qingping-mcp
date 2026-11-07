@@ -1,10 +1,21 @@
 /**
- * analysis.ts — Lecture « humaine » des mesures : niveaux, résumés d'historique.
- * Repères : OMS 2021 (PM2.5 24 h 15 µg/m³, PM10 24 h 45 µg/m³), CO₂ 1000 ppm
- * (confinement), humidité 40–60 %.
+ * analysis.ts — Plain-language reading of the data: levels, history summaries.
+ * References: WHO 2021 (PM2.5 24 h 15 µg/m³, PM10 24 h 45 µg/m³), CO₂ 1000 ppm
+ * (stuffy air), humidity 40–60 %.
  */
 
-import type { MetricKey, Readings, Sample } from './client.js';
+import { iso, type MetricKey, type Readings, type Sample } from './client.js';
+
+/**
+ * Age of a reading and whether it is late. Late = no new data for more than
+ * 2 report intervals (+ 2 min margin).
+ */
+export function freshness(readingAtS: number | null, reportIntervalS: number | null, nowS: number) {
+  if (!readingAtS) return { ageMin: null, stale: true };
+  const ageS = Math.max(0, nowS - readingAtS);
+  const limitS = 2 * (reportIntervalS && reportIntervalS > 0 ? reportIntervalS : 900) + 120;
+  return { ageMin: Math.round(ageS / 60), stale: ageS > limitS };
+}
 
 export const UNITS: Partial<Record<MetricKey, string>> = {
   temperature: '°C',
@@ -15,7 +26,7 @@ export const UNITS: Partial<Record<MetricKey, string>> = {
   pm25: 'µg/m³',
   pm10: 'µg/m³',
   tvoc: 'ppb',
-  tvoc_index: 'index (100 = référence)',
+  tvoc_index: 'index (100 = baseline)',
   noise: 'dB',
   pressure: 'kPa',
   battery: '%',
@@ -26,33 +37,33 @@ type Level = { max: number; label: string };
 
 const SCALES: Partial<Record<MetricKey, Level[]>> = {
   co2: [
-    { max: 800, label: 'bon' },
-    { max: 1000, label: 'correct' },
-    { max: 1500, label: 'élevé — aérer' },
-    { max: Infinity, label: 'très élevé — aérer maintenant' },
+    { max: 800, label: 'good' },
+    { max: 1000, label: 'fair' },
+    { max: 1500, label: 'high — ventilate' },
+    { max: Infinity, label: 'very high — ventilate now' },
   ],
   pm25: [
-    { max: 15, label: 'bon' },
-    { max: 35, label: 'moyen' },
-    { max: 75, label: 'mauvais' },
-    { max: Infinity, label: 'très mauvais' },
+    { max: 15, label: 'good' },
+    { max: 35, label: 'moderate' },
+    { max: 75, label: 'poor' },
+    { max: Infinity, label: 'very poor' },
   ],
   pm10: [
-    { max: 45, label: 'bon' },
-    { max: 100, label: 'moyen' },
-    { max: Infinity, label: 'mauvais' },
+    { max: 45, label: 'good' },
+    { max: 100, label: 'moderate' },
+    { max: Infinity, label: 'poor' },
   ],
   humidity: [
-    { max: 30, label: 'trop sec' },
-    { max: 40, label: 'sec' },
-    { max: 60, label: 'bon' },
-    { max: 70, label: 'humide' },
-    { max: Infinity, label: 'très humide — risque de moisissures' },
+    { max: 30, label: 'too dry' },
+    { max: 40, label: 'dry' },
+    { max: 60, label: 'good' },
+    { max: 70, label: 'humid' },
+    { max: Infinity, label: 'very humid — mould risk' },
   ],
   tvoc_index: [
-    { max: 150, label: 'bon' },
-    { max: 250, label: 'moyen' },
-    { max: Infinity, label: 'élevé' },
+    { max: 150, label: 'good' },
+    { max: 250, label: 'moderate' },
+    { max: Infinity, label: 'high' },
   ],
 };
 
@@ -66,7 +77,7 @@ export function assess(readings: Readings): Record<string, string> {
   return out;
 }
 
-/** Ajoute l'unité à chaque valeur (« 1068 ppm »). */
+/** Appends the unit to each value ("1068 ppm"). */
 export function withUnits(readings: Readings): Record<string, string | number> {
   const out: Record<string, string | number> = {};
   for (const [key, v] of Object.entries(readings) as [MetricKey, number][]) {
@@ -85,7 +96,7 @@ function median(values: number[]): number {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
-/** Seuils pour lesquels on compte le temps passé au-dessus. */
+/** Thresholds for which the time spent above is counted. */
 const THRESHOLDS: Partial<Record<MetricKey, number[]>> = {
   co2: [1000, 1500],
   pm25: [15, 35],
@@ -147,7 +158,46 @@ export function summarize(samples: Sample[], metrics?: MetricKey[]) {
   };
 }
 
-/** Réduit une série à `maxPoints` points (moyenne par tranche). */
+/**
+ * Share of the window [startS, endS] actually covered by readings.
+ * A sample covers at most 2 intervals after it; beyond that it is a gap
+ * (sensor offline, Wi-Fi without Internet, device not yet reaching the cloud).
+ */
+export function coverage(samples: Sample[], startS: number, endS: number, intervalS: number | null) {
+  const windowS = Math.max(0, endS - startS);
+  const step = intervalS && intervalS > 0 ? intervalS : 300;
+  let coveredS = 0;
+  let largestGapS = 0;
+  let largestGap: [number, number] | null = null;
+  let prev = startS;
+  const points = samples.filter((s) => s.ts >= startS && s.ts <= endS);
+  for (const s of points) {
+    const gap = s.ts - prev;
+    if (gap > largestGapS) {
+      largestGapS = gap;
+      largestGap = [prev, s.ts];
+    }
+    prev = s.ts;
+  }
+  for (let i = 0; i < points.length; i++) {
+    const next = i + 1 < points.length ? points[i + 1].ts : endS;
+    coveredS += Math.min(next - points[i].ts, 2 * step);
+  }
+  if (endS - prev > largestGapS) {
+    largestGapS = endS - prev;
+    largestGap = [prev, endS];
+  }
+  const percent = windowS ? Math.round((Math.min(coveredS, windowS) / windowS) * 100) : 0;
+  return {
+    windowMin: Math.round(windowS / 60),
+    coveredMin: Math.round(Math.min(coveredS, windowS) / 60),
+    percent,
+    largestGapMin: Math.round(largestGapS / 60),
+    largestGap: largestGap && largestGapS > 2 * step ? { from: iso(largestGap[0]), to: iso(largestGap[1]) } : null,
+  };
+}
+
+/** Reduces a series to `maxPoints` points (average per bucket). */
 export function downsample(samples: Sample[], maxPoints: number, metrics?: MetricKey[]) {
   const pick = (r: Readings) => {
     const out: Readings = {};

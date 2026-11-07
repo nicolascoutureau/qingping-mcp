@@ -1,7 +1,7 @@
 {
   "name": "qingping-mcp",
   "version": "0.1.0",
-  "description": "Serveur MCP pour les capteurs Qingping (Air Monitor CGS1…) via l'Open API cloud",
+  "description": "MCP server for Qingping air quality monitors (CO₂, PM2.5, tVOC…) via the Qingping cloud Open API",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

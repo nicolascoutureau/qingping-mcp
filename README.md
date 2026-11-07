@@ -1,22 +1,22 @@
 # qingping-mcp
 
-Serveur [MCP](https://modelcontextprotocol.io) pour les capteurs d'air **Qingping** (Air Monitor CGS1, Air Monitor 2, Lite, thermomètres…), via l'[Open API cloud officielle](https://developer.qingping.co/cloud-to-cloud/open-apis).
+[MCP](https://modelcontextprotocol.io) server for **Qingping** air quality monitors (Air Monitor CGS1, Air Monitor 2, Lite, thermometers…), through the [official cloud Open API](https://developer.qingping.co/cloud-to-cloud/open-apis).
 
-Il permet de demander à Claude (ou à tout client MCP) : « quel est le CO₂ dans la chambre ? », « le CO₂ a-t-il dépassé 1000 ppm cette nuit ? », « montre-moi la courbe de PM2.5 sur 7 jours ».
+Ask Claude (or any MCP client): "what's the CO₂ in the bedroom?", "did CO₂ go above 1000 ppm last night?", "show me the PM2.5 curve over 7 days".
 
-## Outils
+## Tools
 
-| Outil | Rôle |
+| Tool | What it does |
 |---|---|
-| `qingping_current` | Dernières mesures (CO₂, PM2.5, PM10, tVOC, température, humidité, batterie…) avec un niveau lisible (bon / élevé — aérer…) |
-| `qingping_history` | Historique sur une période : min / max / moyenne par métrique, heure du pic, minutes au-dessus des seuils (CO₂ > 1000 / 1500 ppm, PM2.5 > 15 / 35, humidité > 60 / 70 %), série optionnelle pour tracer une courbe |
-| `qingping_alerts` | Alertes déclenchées (seuils réglés dans l'app) |
-| `qingping_set_intervals` | Intervalles de mesure et d'envoi au cloud |
+| `qingping_current` | Latest readings (CO₂, PM2.5, PM10, tVOC, temperature, humidity, battery…) with a plain-language level (good / high — ventilate…), the age of the reading and a warning when it is stale |
+| `qingping_history` | History over a period: min / max / average per metric, time of the peak, minutes above thresholds (CO₂ > 1000 / 1500 ppm, PM2.5 > 15 / 35, humidity > 60 / 70 %), share of the period actually covered, optional series to draw a chart |
+| `qingping_alerts` | Triggered alerts (thresholds set in the app) |
+| `qingping_set_intervals` | Measurement and cloud upload intervals |
 
-## Installation
+## Setup
 
-1. Sur [developer.qingping.co](https://developer.qingping.co), connectez-vous avec le compte de l'app Qingping+ / Qingping IoT où sont vos capteurs, puis **Access management** → copiez l'**App Key** et l'**App Secret**.
-2. Construisez le serveur :
+1. On [developer.qingping.co](https://developer.qingping.co), log in with the Qingping+ / Qingping IoT account that owns your sensors, then **Access management** → copy the **App Key** and **App Secret**.
+2. Build the server:
 
    ```sh
    git clone https://github.com/nicolascoutureau/qingping-mcp.git
@@ -24,33 +24,33 @@ Il permet de demander à Claude (ou à tout client MCP) : « quel est le CO₂ d
    npm install && npm run build
    ```
 
-3. Mettez les clés dans un fichier `.env` à la racine (il n'est pas versionné) :
+3. Put the keys in a `.env` file at the project root (it is git-ignored):
 
    ```sh
    QINGPING_APP_KEY=...
    QINGPING_APP_SECRET=...
    ```
 
-   ou passez-les en variables d'environnement.
-4. Ajoutez le serveur à Claude Code :
+   or pass them as environment variables.
+4. Add the server to Claude Code:
 
    ```sh
-   claude mcp add -s user qingping -- node /chemin/vers/qingping-mcp/dist/index.js
+   claude mcp add -s user qingping -- node /path/to/qingping-mcp/dist/index.js
    ```
 
-## Dépannage
+## Troubleshooting
 
-- **L'appareil apparaît mais sans aucune mesure** (`readingAt: null`, historique vide, « No historical data » dans l'app) : le capteur n'atteint pas le cloud Qingping. Vérifiez la date et l'heure affichées sur le capteur : si elles sont fausses (ex. 2015), il est connecté au Wi-Fi mais pas à Internet. Réinitialisez son Wi-Fi et réappairez-le dans l'app (réseau 2,4 GHz). Les valeurs « Now » de l'app peuvent arriver en Bluetooth et masquer le problème.
-- **Fraîcheur** : le cloud ne connaît que ce que le capteur envoie (15 min par défaut). `qingping_set_intervals` permet de descendre à quelques minutes pour un appareil sur secteur.
-- **tVOC** : l'API le renvoie en ppb (l'app l'affiche en mg/m³).
+- **The device is listed but has no reading at all** (`readingAt: null`, empty history, "No historical data" in the app): the sensor is not reaching the Qingping cloud. Check the date and time on the sensor's screen: if they are wrong (e.g. 2015), it is connected to Wi-Fi but has no Internet access. Reset its Wi-Fi and pair it again in the app (2.4 GHz network). The app's "Now" values may arrive over Bluetooth and hide the problem.
+- **Freshness**: the cloud only knows what the sensor uploads (every 15 min by default). `qingping_set_intervals` can bring it down to a few minutes for a plugged-in device.
+- **tVOC**: the API returns it in ppb (the app shows mg/m³).
 
-## Développement
+## Development
 
 ```sh
-npm test          # tests (API simulée)
+npm test          # tests (simulated API)
 npm run inspect   # MCP Inspector
 ```
 
-## Licence
+## License
 
 MIT

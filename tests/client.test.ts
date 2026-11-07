@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { QingpingClient, type RequestFn } from '../src/client.js';
-import { summarize, assess, downsample } from '../src/analysis.js';
+import { summarize, assess, downsample, freshness, coverage } from '../src/analysis.js';
 
 const NOW = 1_762_545_600_000; // ms
 
@@ -60,20 +60,20 @@ function fakeCloud(overrides: Partial<Record<string, (url: URL) => { status: num
 }
 
 describe('QingpingClient', () => {
-  it('obtient un token puis liste les appareils', async () => {
+  it('gets a token then lists devices', async () => {
     const { request, calls } = fakeCloud();
     const c = new QingpingClient('key', 'secret', request, () => NOW);
     const [d] = await c.listDevices();
     expect(d.mac).toBe('582D34000001');
     expect(d.name).toBe('Chambre');
     expect(d.readings.co2).toBe(1068);
-    expect(d.unhealthy).toEqual(['tvoc (préchauffage)']);
+    expect(d.unhealthy).toEqual(['tvoc (warming up)']);
     expect(calls[0].headers.authorization).toBe(`Basic ${Buffer.from('key:secret').toString('base64')}`);
     expect(calls[1].headers.authorization).toBe('Bearer tok-1');
     expect(calls[1].url.searchParams.get('timestamp')).toBe(String(NOW));
   });
 
-  it('réutilise le token et le renouvelle après un 401', async () => {
+  it('reuses the token and renews it after a 401', async () => {
     let first = true;
     const { request, calls } = fakeCloud({
       'GET /v1/apis/devices': () => {
@@ -94,7 +94,7 @@ describe('QingpingClient', () => {
     ]);
   });
 
-  it("pagine l'historique", async () => {
+  it('paginates the history', async () => {
     const { request } = fakeCloud();
     const c = new QingpingClient('key', 'secret', request, () => NOW);
     const s = await c.history('582D34000001', 1762500000, 1762600000);
@@ -105,22 +105,83 @@ describe('QingpingClient', () => {
     expect(downsample(s, 50)).toHaveLength(50);
   });
 
-  it("ne divulgue pas le secret dans l'erreur d'authentification", async () => {
+  it('does not leak the secret in the auth error', async () => {
     const { request } = fakeCloud({
       'POST /oauth2/token': () => ({ status: 401, body: { error: 'invalid_client' } }),
     });
     const c = new QingpingClient('key', 'super-secret-value', request, () => NOW);
-    await expect(c.listDevices()).rejects.toThrow(/refusées \(HTTP 401\): invalid_client/);
+    await expect(c.listDevices()).rejects.toThrow(/refused \(HTTP 401\): invalid_client/);
     await expect(c.listDevices()).rejects.not.toThrow(/super-secret/);
   });
 });
 
 describe('assess', () => {
-  it('qualifie les mesures', () => {
+  it('rates the readings', () => {
     expect(assess({ co2: 1068, pm25: 12, humidity: 60.9 })).toEqual({
-      co2: 'élevé — aérer',
-      pm25: 'bon',
-      humidity: 'humide',
+      co2: 'high — ventilate',
+      pm25: 'good',
+      humidity: 'humid',
     });
+  });
+});
+
+describe('listDevices pagination', () => {
+  it('keeps each device once when total is larger than what the API returns', async () => {
+    const page = {
+      total: 2,
+      devices: [{ info: { mac: '582D34000001', name: 'Bedroom' }, data: { co2: { value: 900 } } }],
+    };
+    const { request, calls } = fakeCloud({ 'GET /v1/apis/devices': () => ({ status: 200, body: page }) });
+    const c = new QingpingClient('key', 'secret', request, () => NOW);
+    const devices = await c.listDevices();
+    expect(devices.map((d) => d.mac)).toEqual(['582D34000001']);
+    expect(calls.filter((x) => x.url.pathname === '/v1/apis/devices')).toHaveLength(2);
+  });
+});
+
+describe('freshness', () => {
+  it('is stale with no reading', () => {
+    expect(freshness(null, 300, 10_000)).toEqual({ ageMin: null, stale: true });
+  });
+  it('is fresh within 2 report intervals + 2 min', () => {
+    expect(freshness(10_000 - 700, 300, 10_000)).toEqual({ ageMin: 12, stale: false });
+  });
+  it('is stale beyond 2 report intervals + 2 min', () => {
+    expect(freshness(10_000 - 800, 300, 10_000)).toEqual({ ageMin: 13, stale: true });
+  });
+  it('falls back to a 15 min interval when unknown', () => {
+    expect(freshness(10_000 - 1_900, null, 10_000).stale).toBe(false);
+    expect(freshness(10_000 - 2_000, null, 10_000).stale).toBe(true);
+  });
+});
+
+describe('coverage', () => {
+  const sample = (ts: number) => ({ ts, at: String(ts), readings: { co2: 800 } });
+
+  it('is zero for an empty window', () => {
+    const c = coverage([], 0, 3_600, 60);
+    expect(c).toMatchObject({ windowMin: 60, coveredMin: 0, percent: 0, largestGapMin: 60 });
+    expect(c.largestGap).not.toBeNull();
+  });
+
+  it('is full for regular samples', () => {
+    const samples = Array.from({ length: 60 }, (_, i) => sample(i * 60));
+    const c = coverage(samples, 0, 3_600, 60);
+    expect(c.percent).toBe(100);
+    expect(c.largestGap).toBeNull();
+  });
+
+  it('reports the largest gap', () => {
+    // Samples during the first 10 minutes only, then nothing for 50 minutes.
+    const samples = Array.from({ length: 10 }, (_, i) => sample(i * 60));
+    const c = coverage(samples, 0, 3_600, 60);
+    expect(c.coveredMin).toBe(11);
+    expect(c.percent).toBe(18);
+    expect(c.largestGapMin).toBe(51);
+    expect(c.largestGap).not.toBeNull();
+  });
+
+  it('ignores samples outside the window', () => {
+    expect(coverage([sample(-100), sample(5_000)], 0, 3_600, 60).coveredMin).toBe(0);
   });
 });

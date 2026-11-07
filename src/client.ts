@@ -1,14 +1,14 @@
 /**
- * client.ts — Client de l'Open API Qingping (developer.qingping.co).
+ * client.ts — Client for the Qingping Open API (developer.qingping.co).
  *
  *   POST https://oauth.cleargrass.com/oauth2/token        (client_credentials, Basic appKey:appSecret)
- *   GET  https://apis.cleargrass.com/v1/apis/devices         appareils + dernière mesure
- *   GET  https://apis.cleargrass.com/v1/apis/devices/data    historique (start_time / end_time en s)
- *   GET  https://apis.cleargrass.com/v1/apis/devices/events  alertes déclenchées
- *   PUT  https://apis.cleargrass.com/v1/apis/devices/settings intervalles de report / mesure
+ *   GET  https://apis.cleargrass.com/v1/apis/devices         devices + latest reading
+ *   GET  https://apis.cleargrass.com/v1/apis/devices/data    history (start_time / end_time in s)
+ *   GET  https://apis.cleargrass.com/v1/apis/devices/events  triggered alerts
+ *   PUT  https://apis.cleargrass.com/v1/apis/devices/settings report / collect intervals
  *
- * Chaque appel porte `timestamp` en millisecondes (comme les SDK officiels).
- * Ni la clé, ni le secret, ni le token n'apparaissent dans un message d'erreur.
+ * Every call carries `timestamp` in milliseconds (as the official SDKs do).
+ * Neither the key, the secret nor the token ever appear in an error message.
  */
 
 export const OAUTH_URL = 'https://oauth.cleargrass.com/oauth2/token';
@@ -48,10 +48,12 @@ export interface Device {
   offline: boolean;
   reportIntervalS: number | null;
   collectIntervalS: number | null;
-  /** Date de la dernière mesure (ISO), null si absente. */
+  /** Time of the latest reading (ISO), null when absent. */
   readingAt: string | null;
+  /** Same instant, in Unix seconds. */
+  readingTs: number | null;
   readings: Readings;
-  /** Capteurs signalés anormaux (status 1) ou en préchauffage (status 2). */
+  /** Sensors reported abnormal (status 1) or warming up (status 2). */
   unhealthy: string[];
 }
 
@@ -97,7 +99,7 @@ const num = (v: unknown): number | null => {
 };
 const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v.trim() : null);
 const obj = (v: unknown): Json => (v && typeof v === 'object' ? (v as Json) : {});
-/** Secondes Unix → ISO 8601 à l'heure locale de la machine, avec décalage (2026-11-07T21:13:00+01:00). */
+/** Unix seconds → ISO 8601 in the machine's local time, with offset (2026-11-07T21:13:00+01:00). */
 export function iso(s: number | null): string | null {
   if (!s || s <= 0) return null;
   const d = new Date(s * 1000);
@@ -115,7 +117,7 @@ function parseJson(text: string): unknown {
   }
 }
 
-/** Message d'erreur Qingping, court et sans rien qui ressemble à un secret. */
+/** Qingping error message, short and free of anything that looks like a secret. */
 function describe(body: string): string {
   const j = obj(parseJson(body));
   const m = j.msg ?? j.message ?? j.error_description ?? j.error ?? '';
@@ -124,7 +126,7 @@ function describe(body: string): string {
     .slice(0, 160);
 }
 
-/** Lit un bloc `data` ({ temperature: { value, status } ... }). */
+/** Reads a `data` block ({ temperature: { value, status } ... }). */
 export function parseReadings(raw: unknown): { readings: Readings; unhealthy: string[]; ts: number | null } {
   const data = obj(raw);
   const readings: Readings = {};
@@ -134,9 +136,9 @@ export function parseReadings(raw: unknown): { readings: Readings; unhealthy: st
     const value = num(entry.value);
     if (value === null) continue;
     const status = num(entry.status);
-    // Pour la batterie, status = état de charge, pas santé du capteur.
+    // For the battery, status is the charging state, not sensor health.
     if (key !== 'battery' && (status === 1 || status === 2)) {
-      unhealthy.push(`${key}${status === 2 ? ' (préchauffage)' : ' (anormal)'}`);
+      unhealthy.push(`${key}${status === 2 ? ' (warming up)' : ' (abnormal)'}`);
     }
     readings[key] = value;
   }
@@ -168,6 +170,7 @@ export function parseDevice(raw: unknown): Device | null {
     reportIntervalS: positive(setting.report_interval),
     collectIntervalS: positive(setting.collect_interval),
     readingAt: iso(ts),
+    readingTs: ts && ts > 0 ? ts : null,
     readings,
     unhealthy,
   };
@@ -189,8 +192,8 @@ export class QingpingClient {
       return await this.request(url, init);
     } catch (err) {
       const e = err as { name?: string; code?: string; cause?: { code?: string } };
-      const reason = e?.name === 'TimeoutError' ? 'délai dépassé' : e?.cause?.code ?? e?.code ?? e?.name ?? 'erreur';
-      throw new QingpingError(`Cloud Qingping injoignable (${reason})`);
+      const reason = e?.name === 'TimeoutError' ? 'timed out' : e?.cause?.code ?? e?.code ?? e?.name ?? 'error';
+      throw new QingpingError(`Qingping cloud unreachable (${reason})`);
     }
   }
 
@@ -205,7 +208,7 @@ export class QingpingClient {
   private async requestToken(): Promise<string> {
     if (!this.appKey || !this.appSecret) {
       throw new QingpingError(
-        'QINGPING_APP_KEY et QINGPING_APP_SECRET ne sont pas définies (developer.qingping.co → Access management).',
+        'QINGPING_APP_KEY and QINGPING_APP_SECRET are not set (developer.qingping.co → Access management).',
       );
     }
     const basic = Buffer.from(`${this.appKey}:${this.appSecret}`).toString('base64');
@@ -221,19 +224,19 @@ export class QingpingClient {
     if (res.status !== 200) {
       const detail = describe(res.body);
       throw new QingpingError(
-        `App Key / App Secret refusées (HTTP ${res.status})${detail ? `: ${detail}` : ''}`,
+        `App Key / App Secret refused (HTTP ${res.status})${detail ? `: ${detail}` : ''}`,
         res.status,
       );
     }
     const j = obj(parseJson(res.body));
     const value = str(j.access_token);
-    if (!value) throw new QingpingError('Réponse OAuth sans access_token');
+    if (!value) throw new QingpingError('OAuth answer without access_token');
     const lifetime = num(j.expires_in) ?? 7200;
     this.token = { value, expiresAt: this.now() + lifetime * 1000 };
     return value;
   }
 
-  /** Appel authentifié ; un token refusé (401) est renouvelé une fois. */
+  /** Authenticated call; a refused token (401) is renewed once. */
   private async call(
     path: string,
     opts: { method?: 'GET' | 'PUT'; query?: Record<string, string | number>; json?: Json } = {},
@@ -258,7 +261,7 @@ export class QingpingClient {
         this.token = null;
         continue;
       }
-      // Erreur passagère du cloud (502/503/504) : une seconde tentative après 2 s.
+      // Transient cloud error (502/503/504): one more try after 2 s.
       if (res.status >= 502 && res.status <= 504 && attempt === 0) {
         await new Promise((r) => setTimeout(r, 2000));
         continue;
@@ -266,22 +269,22 @@ export class QingpingClient {
       if (res.status !== 200) {
         const detail = describe(res.body);
         throw new QingpingError(
-          `Qingping a répondu HTTP ${res.status} sur ${path}${detail ? `: ${detail}` : ''}`,
+          `Qingping answered HTTP ${res.status} on ${path}${detail ? `: ${detail}` : ''}`,
           res.status,
         );
       }
-      // Les écritures (PUT) peuvent répondre 200 avec un corps vide.
+      // Writes (PUT) may answer 200 with an empty body.
       if (method !== 'GET' && !res.body.trim()) return {};
       const body = parseJson(res.body);
-      if (!body || typeof body !== 'object') throw new QingpingError(`Réponse non JSON sur ${path}`);
+      if (!body || typeof body !== 'object') throw new QingpingError(`Non-JSON answer on ${path}`);
       const j = body as Json;
-      // L'API peut répondre 200 avec un message d'erreur à la place des données.
+      // The API may answer 200 with an error message instead of data.
       if (str(j.msg) && !('devices' in j) && !('data' in j) && !('events' in j)) {
-        throw new QingpingError(`Qingping a refusé ${path}: ${describe(res.body)}`);
+        throw new QingpingError(`Qingping refused ${path}: ${describe(res.body)}`);
       }
       return j;
     }
-    throw new QingpingError('Accès refusé (HTTP 401)', 401);
+    throw new QingpingError('Access refused (HTTP 401)', 401);
   }
 
   async listDevices(): Promise<Device[]> {
@@ -290,15 +293,21 @@ export class QingpingClient {
     for (let page = 0; page < MAX_PAGES; page++) {
       const body = await this.call('/devices', { query: { offset, limit: PAGE_SIZE } });
       const list = Array.isArray(body.devices) ? body.devices : [];
-      devices.push(...list.map(parseDevice).filter((d): d is Device => d !== null));
+      // The API may report a `total` larger than what it returns and serve the
+      // same device again at the next offset: keep each MAC once, and stop when
+      // a page brings nothing new.
+      const fresh = list
+        .map(parseDevice)
+        .filter((d): d is Device => d !== null && !devices.some((known) => known.mac === d.mac));
+      devices.push(...fresh);
       offset += list.length;
       const total = num(body.total);
-      if (list.length === 0 || total === null || offset >= total) break;
+      if (list.length === 0 || fresh.length === 0 || total === null || offset >= total) break;
     }
     return devices;
   }
 
-  /** Historique des mesures entre deux instants (secondes Unix). */
+  /** Reading history between two instants (Unix seconds). */
   async history(mac: string, startS: number, endS: number): Promise<Sample[]> {
     const samples: Sample[] = [];
     let offset = 0;
@@ -318,7 +327,7 @@ export class QingpingClient {
     return samples.sort((a, b) => a.ts - b.ts);
   }
 
-  /** Alertes (seuils configurés dans l'app) déclenchées entre deux instants. */
+  /** Alerts (thresholds set in the app) triggered between two instants. */
   async events(mac: string, startS: number, endS: number): Promise<AlertEvent[]> {
     const out: AlertEvent[] = [];
     let offset = 0;
